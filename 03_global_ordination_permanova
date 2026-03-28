@@ -1,0 +1,175 @@
+# ============================================================
+# 03_global_ordination_permanova.R
+#
+# Purpose
+# -------
+# Carry out the main global multivariate analyses for the Chapter 4
+# metabolomics dataset.
+#
+# Main questions addressed
+# ------------------------
+# 1. Is metabolome structure associated with variety, stage, or both?
+# 2. Is there a variety × stage interaction?
+# 3. Are differences driven by centroid shifts, dispersion differences, or both?
+# 4. How do within-variety stage contrasts behave?
+#
+# Outputs
+# -------
+# - outputs/tables/global_permanova_summary.csv
+# - outputs/tables/pairwise_permanova_stage_within_variety.csv
+# - outputs/figures/global_pca_pcoa/
+#
+# Notes
+# -----
+# The original working script also contained exploratory anchor-stage and
+# restricted-stage variants. Those can be added back if needed, but this
+# cleaned script focuses on the core thesis analyses.
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(readr)
+  library(vegan)
+})
+
+xlong_file <- "data/processed/normalised/X_long_final.csv"
+fig_dir <- "outputs/figures/global_pca_pcoa"
+tab_dir <- "outputs/tables"
+dir.create(fig_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(tab_dir, showWarnings = FALSE, recursive = TRUE)
+
+X_long_final <- readr::read_csv(xlong_file, show_col_types = FALSE)
+
+value_col <- "area_log2_qc_loess_mass"
+stopifnot(value_col %in% names(X_long_final))
+
+# Keep inoculated biological samples only for the global host × stage analyses
+df_inoc <- X_long_final %>%
+  filter(sample_type == "Sample", inoc_status == "inoculated") %>%
+  filter(!is.na(variety), !is.na(stage_matched) | !is.na(stage)) %>%
+  mutate(stage_final = coalesce(stage_matched, stage))
+
+# Wide matrix
+X_wide <- df_inoc %>%
+  select(sample_id, master_feature_id, !!sym(value_col)) %>%
+  pivot_wider(names_from = master_feature_id, values_from = !!sym(value_col))
+
+meta <- df_inoc %>%
+  distinct(sample_id, variety, stage_final, dpi) %>%
+  arrange(match(sample_id, X_wide$sample_id))
+
+X_mat <- X_wide %>%
+  arrange(sample_id) %>%
+  column_to_rownames("sample_id") %>%
+  as.matrix()
+
+# Feature-wise minimum imputation for ordination
+for (j in seq_len(ncol(X_mat))) {
+  col <- X_mat[, j]
+  if (anyNA(col)) {
+    mn <- suppressWarnings(min(col, na.rm = TRUE))
+    if (!is.finite(mn)) mn <- 0
+    col[is.na(col)] <- mn
+    X_mat[, j] <- col
+  }
+}
+
+# PCA
+pca <- prcomp(X_mat, center = TRUE, scale. = FALSE)
+var_exp <- (pca$sdev^2 / sum(pca$sdev^2)) * 100
+
+pca_df <- as.data.frame(pca$x[, 1:2, drop = FALSE]) %>%
+  rownames_to_column("sample_id") %>%
+  left_join(meta, by = "sample_id")
+
+p_pca <- ggplot(pca_df, aes(PC1, PC2, color = variety, shape = stage_final)) +
+  geom_point(size = 2.5, alpha = 0.9) +
+  theme_bw() +
+  labs(
+    title = "Global PCA of inoculated root metabolomes",
+    x = paste0("PC1 (", round(var_exp[1], 1), "%)"),
+    y = paste0("PC2 (", round(var_exp[2], 1), "%)")
+  )
+
+ggsave(file.path(fig_dir, "Fig_global_PCA_inoculated.png"), p_pca, width = 8, height = 6, dpi = 300)
+
+# Bray–Curtis on non-negative transformed values
+X_bc <- X_mat
+X_bc[X_bc < 0] <- 0
+bc <- vegdist(X_bc, method = "bray")
+
+# PCoA
+pcoa <- cmdscale(bc, eig = TRUE, k = 2)
+pcoa_df <- as.data.frame(pcoa$points) %>%
+  setNames(c("Axis1", "Axis2")) %>%
+  rownames_to_column("sample_id") %>%
+  left_join(meta, by = "sample_id")
+
+p_pcoa <- ggplot(pcoa_df, aes(Axis1, Axis2, color = variety, shape = stage_final)) +
+  geom_point(size = 2.5, alpha = 0.9) +
+  theme_bw() +
+  labs(
+    title = "Bray–Curtis PCoA of inoculated root metabolomes",
+    x = "Axis 1",
+    y = "Axis 2"
+  )
+
+ggsave(file.path(fig_dir, "Fig_global_PCoA_inoculated.png"), p_pcoa, width = 8, height = 6, dpi = 300)
+
+# PERMANOVA
+meta_perm <- meta %>%
+  mutate(
+    variety = factor(variety),
+    stage_final = factor(stage_final)
+  )
+
+perm_global <- adonis2(bc ~ variety * stage_final, data = meta_perm, permutations = 9999)
+perm_variety <- adonis2(bc ~ variety, data = meta_perm, permutations = 9999)
+perm_stage <- adonis2(bc ~ stage_final, data = meta_perm, permutations = 9999)
+
+global_tbl <- bind_rows(
+  broom::tidy(perm_global) %>% mutate(model = "variety_x_stage"),
+  broom::tidy(perm_variety) %>% mutate(model = "variety_only"),
+  broom::tidy(perm_stage) %>% mutate(model = "stage_only")
+)
+
+write_csv(global_tbl, file.path(tab_dir, "global_permanova_summary.csv"))
+
+# PERMDISP
+disp_stage <- betadisper(bc, meta_perm$stage_final)
+disp_variety <- betadisper(bc, meta_perm$variety)
+
+disp_tbl <- bind_rows(
+  broom::tidy(anova(disp_stage)) %>% mutate(model = "dispersion_stage"),
+  broom::tidy(anova(disp_variety)) %>% mutate(model = "dispersion_variety")
+)
+
+write_csv(disp_tbl, file.path(tab_dir, "global_permdisp_summary.csv"))
+
+# Pairwise stage PERMANOVA within each variety
+run_pairwise_stage <- function(vv) {
+  keep <- meta_perm$variety == vv
+  bc_sub <- as.dist(as.matrix(bc)[keep, keep])
+  meta_sub <- meta_perm[keep, , drop = FALSE]
+
+  stages <- unique(as.character(meta_sub$stage_final))
+  if (length(stages) < 2) return(NULL)
+
+  pairs <- combn(stages, 2, simplify = FALSE)
+
+  purrr::map_dfr(pairs, function(pair) {
+    k <- meta_sub$stage_final %in% pair
+    bc_pair <- as.dist(as.matrix(bc_sub)[k, k])
+    meta_pair <- droplevels(meta_sub[k, , drop = FALSE])
+
+    fit <- adonis2(bc_pair ~ stage_final, data = meta_pair, permutations = 9999)
+    broom::tidy(fit) %>%
+      mutate(
+        variety = vv,
+        comparison = paste(pair, collapse = "_vs_")
+      )
+  })
+}
+
+pairwise_tbl <- purrr::map_dfr(unique(as.character(meta_perm$variety)), run_pairwise_stage)
+write_csv(pairwise_tbl, file.path(tab_dir, "pairwise_permanova_stage_within_variety.csv")
