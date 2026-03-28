@@ -1,0 +1,357 @@
+# ===========================================================
+# 01_normalise_qcloess
+#
+# Purpose
+# -------
+# Apply the Chapter 4 QC-guided positive-mode normalisation workflow.
+#
+# Workflow implemented
+# --------------------
+# 1. Load collated metadata and Area matrix.
+# 2. Correct and re-check sample-type labels.
+# 3. Remove flagged QC injections before QC-based filtering.
+# 4. Convert the matrix to long format.
+# 5. Apply QC-presence screening.
+# 6. Fit feature-wise QC-LOESS correction against injection order.
+# 7. Apply procedural blank filtering on the back-transformed scale.
+# 8. Mass-normalise biological samples by extraction weight.
+# 9. Apply QC-RSD gating where adequate QC coverage exists.
+# 10. Add control metadata and stage-matched control labels.
+#
+# Main outputs
+# ------------
+# - data/processed/normalised/X_long_final.csv
+# - outputs/intermediate/*.csv
+#
+# Notes
+# -----
+# This script reflects the thesis workflow described in the methods:
+# two problematic QCs removed, QC presence gating before LOESS,
+# blank filtering after LOESS, then mass normalisation and QC-RSD checks.
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(readr)
+  library(stringr)
+})
+
+analysis_dir <- "data/processed"
+out_dir <- "data/processed/normalised"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+meta_path <- file.path(analysis_dir, "metadata_master.csv")
+X_path <- file.path(analysis_dir, "X_area_master.csv")
+
+meta <- readr::read_csv(meta_path, show_col_types = FALSE)
+X <- readr::read_csv(X_path, show_col_types = FALSE)
+
+# ----------------------------
+# 1) Flag problematic pooled QCs
+# ----------------------------
+qc_drop <- c(
+  "0026_250411_POS_QC_01",
+  "0074_250411_POS_QC_03"
+)
+
+# ----------------------------
+# 2) Reassert robust sample typing
+# ----------------------------
+meta <- meta %>%
+  mutate(
+    sample_id_l  = tolower(sample_id),
+    code_token_u = toupper(code_token),
+    sample_type = case_when(
+      str_detect(sample_id_l, "_qc_") | str_detect(code_token_u, "^QC") ~ "QC",
+      str_detect(sample_id_l, "_blank_") | str_detect(code_token_u, "^BLANK") | code_token_u == "BLANK" ~ "Blank",
+      TRUE ~ sample_type
+    ),
+    inj_order = suppressWarnings(as.integer(inj_order)),
+    extraction_weight_mg = suppressWarnings(as.numeric(extraction_weight_mg)),
+    norm_divisor_mg = if_else(sample_type == "Sample", extraction_weight_mg, NA_real_),
+    flag_missing_weight = (sample_type == "Sample") &
+      (is.na(norm_divisor_mg) | norm_divisor_mg <= 0)
+  ) %>%
+  select(-sample_id_l, -code_token_u)
+
+# ----------------------------
+# 3) Convert collated matrix to long format
+# ----------------------------
+X_long <- X %>%
+  pivot_longer(
+    cols = -master_feature_id,
+    names_to = "sample_id",
+    values_to = "area"
+  ) %>%
+  left_join(
+    meta %>% select(any_of(c(
+      "sample_id", "inj_order", "sample_type", "code_token", "dpi", "variety",
+      "timepoint", "norm_divisor_mg", "flag_missing_weight"
+    ))),
+    by = "sample_id"
+  ) %>%
+  mutate(
+    area = suppressWarnings(as.numeric(area)),
+    area_log2_raw = log2(pmax(area, 0) + 1)
+  )
+
+write_csv(X_long, file.path(out_dir, "X_long_raw_preLOESS.csv"))
+
+# ----------------------------
+# 4) Define analysis set
+# ----------------------------
+meta_use <- meta %>%
+  mutate(
+    exclude_qc_drop = (sample_type == "QC") & (sample_id %in% qc_drop),
+    exclude_analysis = flag_missing_weight | exclude_qc_drop
+  ) %>%
+  mutate(
+    exclude_analysis = case_when(
+      sample_type %in% c("QC", "Blank") & !exclude_qc_drop ~ FALSE,
+      TRUE ~ exclude_analysis
+    )
+  )
+
+write_csv(meta_use, file.path(out_dir, "metadata_analysis_set.csv"))
+
+X_long_use <- X_long %>%
+  left_join(meta_use %>% select(sample_id, exclude_analysis), by = "sample_id") %>%
+  filter(!exclude_analysis)
+
+qc_n <- X_long_use %>%
+  filter(sample_type == "QC") %>%
+  distinct(sample_id) %>%
+  nrow()
+
+# ----------------------------
+# 5) QC-presence filter before LOESS
+# ----------------------------
+qc_presence_cutoff <- 0.40
+min_qc_nonNA_abs <- min(5, qc_n)
+
+feat_qc_presence <- X_long_use %>%
+  filter(sample_type == "QC") %>%
+  group_by(master_feature_id) %>%
+  summarise(
+    n_qc_total = qc_n,
+    n_qc_nonNA = sum(!is.na(area_log2_raw)),
+    qc_presence = n_qc_nonNA / n_qc_total,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    pass_qc_presence = (qc_presence >= qc_presence_cutoff) &
+      (n_qc_nonNA >= min_qc_nonNA_abs)
+  )
+
+write_csv(feat_qc_presence, file.path(out_dir, "feature_filter_qc_presence.csv"))
+
+keep_presence_ids <- feat_qc_presence %>%
+  filter(pass_qc_presence) %>%
+  pull(master_feature_id)
+
+X_long_use_loess <- X_long_use %>%
+  filter(master_feature_id %in% keep_presence_ids)
+
+# ----------------------------
+# 6) Feature-wise QC-LOESS correction
+# ----------------------------
+loess_span <- 0.75
+min_qc_n <- min_qc_nonNA_abs
+out_col <- "area_log2_raw_qc_loess"
+
+qc_loess_correct_one_feature <- function(df_feature) {
+  df_feature[[out_col]] <- df_feature$area_log2_raw
+  df_feature$qc_loess_ok <- FALSE
+  df_feature$qc_loess_reason <- "not_run"
+
+  d_qc <- df_feature %>%
+    filter(sample_type == "QC", !is.na(area_log2_raw), !is.na(inj_order)) %>%
+    arrange(inj_order)
+
+  if (nrow(d_qc) < min_qc_n) {
+    df_feature$qc_loess_reason <- "too_few_qc"
+    return(df_feature)
+  }
+
+  fit <- suppressWarnings(
+    tryCatch(
+      loess(area_log2_raw ~ inj_order, data = d_qc, span = loess_span, degree = 1),
+      error = function(e) NULL
+    )
+  )
+
+  if (is.null(fit)) {
+    df_feature$qc_loess_reason <- "loess_fit_failed"
+    return(df_feature)
+  }
+
+  pred_all <- suppressWarnings(tryCatch(predict(fit, newdata = df_feature), error = function(e) rep(NA_real_, nrow(df_feature))))
+  pred_qc  <- suppressWarnings(tryCatch(predict(fit, newdata = d_qc), error = function(e) rep(NA_real_, nrow(d_qc))))
+
+  if (all(is.na(pred_all)) || all(is.na(pred_qc))) {
+    df_feature$qc_loess_reason <- "predict_failed"
+    return(df_feature)
+  }
+
+  ref <- median(pred_qc, na.rm = TRUE)
+
+  df_feature[[out_col]] <- df_feature$area_log2_raw - (pred_all - ref)
+  df_feature$qc_loess_ok <- TRUE
+  df_feature$qc_loess_reason <- "ok"
+  df_feature
+}
+
+X_long_loess <- X_long_use_loess %>%
+  group_by(master_feature_id) %>%
+  group_modify(~ qc_loess_correct_one_feature(.x)) %>%
+  ungroup()
+
+loess_feature_status_in <- X_long_loess %>%
+  distinct(master_feature_id, qc_loess_ok, qc_loess_reason)
+
+write_csv(loess_feature_status_in, file.path(out_dir, "feature_loess_status_entered.csv"))
+
+# Recombine all features: those not entering LOESS retain raw log2 values
+X_long_post <- X_long_use %>%
+  left_join(
+    X_long_loess %>% select(master_feature_id, sample_id, !!out_col),
+    by = c("master_feature_id", "sample_id")
+  ) %>%
+  mutate(
+    !!out_col := coalesce(.data[[out_col]], area_log2_raw)
+  )
+
+write_csv(X_long_post, file.path(out_dir, "X_long_postQCLOESS.csv"))
+
+# ----------------------------
+# 7) Blank filtering after LOESS
+# ----------------------------
+blank_factor <- 2
+blank_eps <- 1
+min_samples <- 3
+min_blank_n <- 3
+
+X_blank_sig <- X_long_post %>%
+  mutate(sig_inj = 2^(.data[[out_col]]) - 1)
+
+feat_blank <- X_blank_sig %>%
+  group_by(master_feature_id) %>%
+  summarise(
+    n_blank = sum(sample_type == "Blank" & !is.na(sig_inj)),
+    blank_ref = median(sig_inj[sample_type == "Blank"], na.rm = TRUE),
+    sample_ref = median(sig_inj[sample_type == "Sample"], na.rm = TRUE),
+    n_above = sum(sample_type == "Sample" & !is.na(sig_inj) &
+                    sig_inj >= (blank_ref * blank_factor), na.rm = TRUE),
+    ratio = (sample_ref + blank_eps) / (blank_ref + blank_eps),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    pass_blank = case_when(
+      n_blank < min_blank_n ~ TRUE,
+      is.na(blank_ref) ~ TRUE,
+      TRUE ~ (ratio >= blank_factor) & (n_above >= min_samples)
+    )
+  )
+
+write_csv(feat_blank, file.path(out_dir, "feature_filter_blank_after_loess.csv"))
+
+keep_blank_ids <- feat_blank %>% filter(pass_blank) %>% pull(master_feature_id)
+
+X_long_post_blankf <- X_long_post %>%
+  filter(master_feature_id %in% keep_blank_ids)
+
+# ----------------------------
+# 8) Mass-normalise biological samples
+# ----------------------------
+X_post_mass <- X_long_post_blankf %>%
+  mutate(
+    sig_inj = 2^(.data[[out_col]]) - 1,
+    sig_mg = case_when(
+      sample_type == "Sample" ~ sig_inj / norm_divisor_mg,
+      TRUE ~ sig_inj
+    ),
+    area_log2_qc_loess_mass = log2(pmax(sig_mg, 0) + 1)
+  )
+
+# ----------------------------
+# 9) QC-RSD gate for features with enough QC coverage
+# ----------------------------
+rsd_cutoff <- 70
+min_qc_rsd <- min(8, qc_n)
+
+feat_rsd_qc <- X_post_mass %>%
+  filter(sample_type == "QC") %>%
+  group_by(master_feature_id) %>%
+  summarise(
+    n_qc = sum(!is.na(sig_mg)),
+    qc_mean = mean(sig_mg, na.rm = TRUE),
+    qc_sd = sd(sig_mg, na.rm = TRUE),
+    qc_rsd = 100 * qc_sd / qc_mean,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    pass_rsd = case_when(
+      n_qc < min_qc_rsd ~ TRUE,
+      !is.finite(qc_rsd) ~ FALSE,
+      TRUE ~ (qc_rsd <= rsd_cutoff)
+    )
+  )
+
+write_csv(feat_rsd_qc, file.path(out_dir, "feature_filter_qc_rsd_gate_nqc.csv"))
+
+keep_rsd_ids <- feat_rsd_qc %>% filter(pass_rsd) %>% pull(master_feature_id)
+
+X_long_final <- X_post_mass %>%
+  filter(master_feature_id %in% keep_rsd_ids)
+
+# ----------------------------
+# 10) Add control metadata and stage matching
+# ----------------------------
+meta_for_final <- X_long_final %>%
+  distinct(sample_id, code_token, sample_type, variety, dpi, timepoint, inj_order) %>%
+  mutate(
+    variety_orig = as.character(variety),
+    code_token_u = toupper(as.character(code_token)),
+    is_non_inoc_control = str_detect(code_token_u, "^[ABCD][BIK]\\d+$"),
+    control_batch = if_else(is_non_inoc_control, str_sub(code_token_u, 1, 1), NA_character_),
+    control_variety_code = if_else(is_non_inoc_control, str_sub(code_token_u, 2, 2), NA_character_),
+    variety_from_ctrl = case_when(
+      control_variety_code == "B" ~ "broccolini",
+      control_variety_code == "I" ~ "broccoli",
+      control_variety_code == "K" ~ "gai-lan",
+      TRUE ~ NA_character_
+    ),
+    variety = if_else(is_non_inoc_control, variety_from_ctrl, variety_orig),
+    inoc_status = if_else(is_non_inoc_control, "control_non_inoc", "inoculated")
+  )
+
+ctrl_map <- tibble(
+  variety = rep(c("broccoli", "gai-lan", "broccolini"), each = 4),
+  control_batch = rep(c("A", "B", "C", "D"), times = 3),
+  control_stage = c(
+    "Stage_0", "Stage_1", "Stage_2", "Stage_3",
+    "Stage_0", "Stage_1", "Stage_2", "Stage_3",
+    "Stage_1", "Stage_2", "Stage_3", "Stage_3"
+  )
+)
+
+meta_for_final <- meta_for_final %>%
+  left_join(ctrl_map, by = c("variety", "control_batch")) %>%
+  mutate(stage_matched = if_else(is_non_inoc_control, control_stage, NA_character_))
+
+X_long_final <- X_long_final %>%
+  left_join(
+    meta_for_final %>%
+      select(sample_id, variety, variety_orig,
+             is_non_inoc_control, control_batch, control_variety_code,
+             variety_from_ctrl, inoc_status, control_stage, stage_matched),
+    by = "sample_id",
+    suffix = c(".x", ".y")
+  ) %>%
+  mutate(variety = coalesce(.data[["variety.y"]], .data[["variety.x"]])) %>%
+  select(-any_of(c("variety.x", "variety.y")))
+
+# ----------------------------
+# 11) Save final table
+# ----------------------------
+write_csv(X_long_final, file.path(out_dir, "X_long_final.csv"))
