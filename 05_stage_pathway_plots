@@ -1,0 +1,132 @@
+# ============================================================
+# 05_stage_pathway_plots.R
+#
+# Purpose
+# -------
+# Summarise and plot stage-associated pathway enrichment results for Chapter 4.
+#
+# What this script expects
+# ------------------------
+# This script assumes mummichog / MetaboAnalyst pathway CSV files have already
+# been exported externally and placed in `data/raw/mummichog_stage_outputs/`.
+#
+# Outputs
+# -------
+# - outputs/figures/pathways/Fig_pathway_scatter_SCA_vs_SESP_combined.png
+# - outputs/intermediate/pathways/MUMMICHOG_STAGES_top_pathways.csv
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(readr)
+  library(dplyr)
+  library(stringr)
+  library(purrr)
+  library(ggplot2)
+  library(ggrepel)
+  library(patchwork)
+})
+
+in_dir <- "data/raw/mummichog_stage_outputs"
+out_dir <- "outputs/figures/pathways"
+tab_dir <- "outputs/intermediate/pathways"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(tab_dir, showWarnings = FALSE, recursive = TRUE)
+
+infer_variety <- function(fn) {
+  fn2 <- toupper(basename(fn))
+  if (str_detect(fn2, "BROCCOLINI")) return("broccolini")
+  if (str_detect(fn2, "BROCCOLI")) return("broccoli")
+  if (str_detect(fn2, "GAI[-_ ]?LAN")) return("gai-lan")
+  return("unknown")
+}
+
+pretty_variety <- function(x) {
+  dplyr::case_when(
+    x == "broccoli" ~ "Broccoli",
+    x == "broccolini" ~ "Broccolini",
+    x == "gai-lan" ~ "Gai-lan",
+    TRUE ~ x
+  )
+}
+
+shorten_pathway <- function(x) {
+  x %>%
+    str_replace_all("Biosynthesis of various plant secondary metabolites", "Plant secondary metabolite biosyn.") %>%
+    str_replace_all("biosynthesis", "biosyn.") %>%
+    str_replace_all("metabolism", "metab.")
+}
+
+pathway_files <- list.files(
+  in_dir,
+  pattern = "mummichog.*pathway.*\\.csv$",
+  full.names = TRUE,
+  ignore.case = TRUE
+)
+
+stopifnot(length(pathway_files) > 0)
+
+pathway_tbl <- purrr::map_dfr(pathway_files, function(f) {
+  df <- read_csv(f, show_col_types = FALSE) %>% rename_with(str_trim)
+  if ("...1" %in% names(df) && !"Pathway" %in% names(df)) {
+    df <- df %>% rename(Pathway = `...1`)
+  }
+
+  df %>%
+    mutate(
+      file = basename(f),
+      variety = infer_variety(f),
+      P_Fisher = suppressWarnings(as.numeric(`P(Fisher)`)),
+      AdjP_Fisher = suppressWarnings(as.numeric(`AdjP.Fisher`)),
+      HitsSig = suppressWarnings(as.numeric(Hits.sig)),
+      ExpectedN = suppressWarnings(as.numeric(Expected))
+    ) %>%
+    filter(
+      !is.na(Pathway),
+      is.finite(P_Fisher), P_Fisher > 0,
+      is.finite(HitsSig),
+      is.finite(ExpectedN), ExpectedN > 0
+    ) %>%
+    mutate(
+      enrich = HitsSig / ExpectedN,
+      neglog10p = -log10(P_Fisher)
+    )
+})
+
+top_pathways <- pathway_tbl %>%
+  group_by(variety) %>%
+  arrange(AdjP_Fisher, P_Fisher) %>%
+  slice_head(n = 10) %>%
+  ungroup()
+
+write_csv(top_pathways, file.path(tab_dir, "MUMMICHOG_STAGES_top_pathways.csv"))
+
+plot_one <- function(vv, label_n = 8) {
+  d_all <- pathway_tbl %>% filter(variety == vv)
+  d_lab <- d_all %>%
+    arrange(AdjP_Fisher, P_Fisher, desc(HitsSig), desc(enrich)) %>%
+    slice_head(n = label_n) %>%
+    mutate(label = stringr::str_wrap(shorten_pathway(Pathway), width = 24))
+
+  ggplot(d_all, aes(enrich, neglog10p)) +
+    geom_point(aes(size = HitsSig, colour = neglog10p), alpha = 0.9) +
+    geom_text_repel(data = d_lab, aes(label = label), size = 3.8, max.overlaps = Inf) +
+    geom_hline(yintercept = -log10(0.05), linetype = 2) +
+    theme_bw(base_size = 13) +
+    labs(
+      title = pretty_variety(vv),
+      x = "Enrichment factor (Hits.sig / Expected)",
+      y = expression(-log[10] * "(P(Fisher))")
+    )
+}
+
+p_broccoli <- plot_one("broccoli", 7)
+p_broccolini <- plot_one("broccolini", 7)
+p_gailan <- plot_one("gai-lan", 10)
+
+p_combined <- (p_broccoli / p_broccolini / p_gailan) +
+  plot_annotation(
+    title = "Mummichog pathway enrichment (SCA vs SESP)",
+    subtitle = "Bubble size = Hits.sig; colour = -log10(P(Fisher))"
+  )
+
+ggsave(file.path(out_dir, "Fig_pathway_scatter_SCA_vs_SESP_combined.png"), p_combined, width = 11, height = 16, dpi = 450)
