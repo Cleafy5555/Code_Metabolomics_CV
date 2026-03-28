@@ -1,0 +1,207 @@
+# ============================================================
+# 07_ml_variety_repeated.R
+#
+# Purpose
+# -------
+# Repeated multinomial elastic-net classification of host background from the
+# final Chapter 4 metabolomics matrix.
+#
+# This script reflects the thesis workflow:
+# - inoculated biological samples only
+# - repeated stratified train/test splitting
+# - train-only preprocessing
+# - 5-fold CV across an alpha grid
+# - held-out evaluation using accuracy, balanced accuracy, and macro-F1
+# - stable feature drivers collected from class-specific coefficients
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(stringr)
+  library(readr)
+  library(purrr)
+  library(tibble)
+  library(glmnet)
+})
+
+xlong_file <- "data/processed/normalised/X_long_final.csv"
+featinfo_file <- "data/processed/feature_info_master.csv"
+out_dir <- "outputs/intermediate/ml_variety"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+X_long_final <- readr::read_csv(xlong_file, show_col_types = FALSE)
+feat_info <- readr::read_csv(featinfo_file, show_col_types = FALSE) %>%
+  transmute(
+    master_feature_id = as.character(master_feature_id),
+    mz_median = suppressWarnings(as.numeric(mz_median)),
+    rt_median = suppressWarnings(as.numeric(rt_median))
+  ) %>%
+  distinct(master_feature_id, .keep_all = TRUE)
+
+value_col <- "area_log2_qc_loess_mass"
+n_repeats <- 30
+train_prop <- 0.80
+na_threshold <- 0.20
+alpha_grid <- c(0, 0.25, 0.5, 0.75, 1)
+nfolds <- 5
+top_k_per_class <- 30
+
+df_ml_long <- X_long_final %>%
+  filter(sample_type == "Sample", inoc_status == "inoculated") %>%
+  mutate(
+    val = suppressWarnings(as.numeric(.data[[value_col]])),
+    variety = factor(variety, levels = c("broccoli", "broccolini", "gai-lan"))
+  ) %>%
+  filter(!is.na(variety)) %>%
+  select(sample_id, variety, master_feature_id, val)
+
+meta_ml <- df_ml_long %>% distinct(sample_id, variety)
+
+X_wide <- df_ml_long %>%
+  pivot_wider(names_from = master_feature_id, values_from = val)
+
+ml_df <- meta_ml %>%
+  inner_join(X_wide, by = "sample_id") %>%
+  filter(!is.na(variety))
+
+split_one_class <- function(df_class, prop = 0.8) {
+  n <- nrow(df_class)
+  n_train <- max(1, floor(prop * n))
+  idx <- sample(seq_len(n), size = n_train)
+  list(train = df_class[idx, , drop = FALSE], test = df_class[-idx, , drop = FALSE])
+}
+
+run_one_repeat <- function(seed_id) {
+  set.seed(seed_id)
+
+  split_list <- ml_df %>%
+    split(.$variety) %>%
+    lapply(split_one_class, prop = train_prop)
+
+  train_df <- bind_rows(lapply(split_list, `[[`, "train")) %>% arrange(variety, sample_id)
+  test_df  <- bind_rows(lapply(split_list, `[[`, "test"))  %>% arrange(variety, sample_id)
+
+  id_cols <- c("sample_id", "variety")
+  pred_cols <- setdiff(names(train_df), id_cols)
+
+  miss_rate <- vapply(train_df[, pred_cols, drop = FALSE], function(x) mean(is.na(x)), numeric(1))
+  keep_cols_1 <- names(miss_rate)[miss_rate <= na_threshold]
+
+  train_df2 <- train_df %>% select(all_of(c(id_cols, keep_cols_1)))
+  test_df2  <- test_df %>% select(all_of(c(id_cols, keep_cols_1)))
+
+  pred_cols2 <- setdiff(names(train_df2), id_cols)
+  train_medians <- vapply(train_df2[, pred_cols2, drop = FALSE], function(x) median(x, na.rm = TRUE), numeric(1))
+  train_medians[!is.finite(train_medians)] <- 0
+
+  for (nm in pred_cols2) {
+    train_df2[[nm]][is.na(train_df2[[nm]])] <- train_medians[[nm]]
+    test_df2[[nm]][is.na(test_df2[[nm]])]   <- train_medians[[nm]]
+  }
+
+  train_sds <- vapply(train_df2[, pred_cols2, drop = FALSE], sd, numeric(1))
+  keep_cols_2 <- names(train_sds)[is.finite(train_sds) & train_sds > 0]
+
+  train_df3 <- train_df2 %>% select(all_of(c(id_cols, keep_cols_2)))
+  test_df3  <- test_df2 %>% select(all_of(c(id_cols, keep_cols_2)))
+
+  pred_cols3 <- setdiff(names(train_df3), id_cols)
+  train_means <- vapply(train_df3[, pred_cols3, drop = FALSE], mean, numeric(1))
+  train_sds2  <- vapply(train_df3[, pred_cols3, drop = FALSE], sd, numeric(1))
+  train_sds2[!is.finite(train_sds2) | train_sds2 == 0] <- 1
+
+  scale_apply <- function(df, means, sds, pred_cols) {
+    x <- as.matrix(df[, pred_cols, drop = FALSE])
+    x <- sweep(x, 2, means[pred_cols], FUN = "-")
+    x <- sweep(x, 2, sds[pred_cols], FUN = "/")
+    x
+  }
+
+  x_train <- scale_apply(train_df3, train_means, train_sds2, pred_cols3)
+  x_test  <- scale_apply(test_df3, train_means, train_sds2, pred_cols3)
+
+  y_train <- train_df3$variety
+  y_test  <- test_df3$variety
+
+  cv_results <- map_dfr(alpha_grid, function(a) {
+    cvfit <- cv.glmnet(
+      x = x_train, y = y_train,
+      family = "multinomial",
+      alpha = a,
+      type.measure = "class",
+      nfolds = nfolds,
+      standardize = FALSE
+    )
+    tibble(alpha = a, lambda_min = cvfit$lambda.min, cv_error_min = min(cvfit$cvm, na.rm = TRUE))
+  })
+
+  best_alpha <- cv_results$alpha[which.min(cv_results$cv_error_min)]
+  best_lambda <- cv_results$lambda_min[which.min(cv_results$cv_error_min)]
+
+  final_fit <- glmnet(
+    x = x_train, y = y_train,
+    family = "multinomial",
+    alpha = best_alpha,
+    lambda = best_lambda,
+    standardize = FALSE
+  )
+
+  pred_class <- predict(final_fit, newx = x_test, type = "class")
+  pred_class <- factor(as.vector(pred_class[, 1]), levels = levels(y_test))
+
+  cm <- table(Truth = y_test, Predicted = pred_class)
+  accuracy_val <- sum(diag(cm)) / sum(cm)
+  recall_vec <- diag(cm) / rowSums(cm)
+  balanced_accuracy_val <- mean(recall_vec, na.rm = TRUE)
+  precision_vec <- diag(cm) / colSums(cm)
+  f1_vec <- 2 * precision_vec * recall_vec / (precision_vec + recall_vec)
+  macro_f1_val <- mean(f1_vec, na.rm = TRUE)
+
+  coef_list <- coef(final_fit)
+  coef_tbl <- bind_rows(lapply(names(coef_list), function(cls) {
+    mat <- as.matrix(coef_list[[cls]])
+    tibble(class = cls, term = rownames(mat), estimate = as.numeric(mat[, 1]))
+  })) %>%
+    filter(term != "(Intercept)") %>%
+    group_by(class) %>%
+    arrange(desc(abs(estimate)), .by_group = TRUE) %>%
+    slice_head(n = top_k_per_class) %>%
+    ungroup() %>%
+    mutate(repeat_id = seed_id)
+
+  list(
+    metrics = tibble(
+      repeat_id = seed_id,
+      accuracy = accuracy_val,
+      balanced_accuracy = balanced_accuracy_val,
+      macro_f1 = macro_f1_val
+    ),
+    confusion = as.data.frame(cm) %>% mutate(repeat_id = seed_id),
+    coefs = coef_tbl
+  )
+}
+
+res <- purrr::map(1:n_repeats, run_one_repeat)
+
+metric_tbl <- bind_rows(lapply(res, `[[`, "metrics"))
+conf_tbl <- bind_rows(lapply(res, `[[`, "confusion"))
+coef_tbl <- bind_rows(lapply(res, `[[`, "coefs")) %>%
+  rename(master_feature_id = term) %>%
+  left_join(feat_info, by = "master_feature_id")
+
+write_csv(metric_tbl, file.path(out_dir, "ML_variety_test_metrics_repeated.csv"))
+write_csv(conf_tbl, file.path(out_dir, "ML_variety_confusion_matrix_repeated.csv"))
+write_csv(coef_tbl, file.path(out_dir, "ML_variety_top_coefficients_repeated.csv"))
+
+metric_summary <- metric_tbl %>%
+  summarise(
+    accuracy_mean = mean(accuracy, na.rm = TRUE),
+    accuracy_sd = sd(accuracy, na.rm = TRUE),
+    balanced_accuracy_mean = mean(balanced_accuracy, na.rm = TRUE),
+    balanced_accuracy_sd = sd(balanced_accuracy, na.rm = TRUE),
+    macro_f1_mean = mean(macro_f1, na.rm = TRUE),
+    macro_f1_sd = sd(macro_f1, na.rm = TRUE)
+  )
+
+write_csv(metric_summary, file.path(out_dir, "ML_variety_metric_summary.csv"))
