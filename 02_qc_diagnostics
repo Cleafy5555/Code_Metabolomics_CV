@@ -1,0 +1,161 @@
+# ============================================================
+# 02_qc_diagnostics.R
+#
+# Purpose
+# -------
+# Generate the paper-ready QC diagnostics described in the Chapter 4 methods
+# and results, especially the evidence that pooled QCs separated from blanks
+# and biological samples and that run-order drift was accounted for.
+#
+# Inputs
+# ------
+# - data/processed/normalised/X_long_final.csv
+#
+# Outputs
+# -------
+# - outputs/figures/qc_diagnostics/*.png
+#
+# Notes
+# -----
+# The original working file contained a long figure notebook. This version
+# keeps the main diagnostics that are most useful for GitHub and for
+# documenting the preprocessing workflow.
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(readr)
+})
+
+xlong_file <- "data/processed/normalised/X_long_final.csv"
+out_dir <- "outputs/figures/qc_diagnostics"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+X_long_final <- readr::read_csv(xlong_file, show_col_types = FALSE)
+
+value_candidates <- c("area_log2_qc_loess_mass", "area_log2_raw_qc_loess", "area_log2_raw")
+value_col <- value_candidates[value_candidates %in% names(X_long_final)][1]
+stopifnot(!is.na(value_col))
+
+build_pca <- function(df_long, value_col, meta_cols) {
+  X_wide <- df_long %>%
+    select(master_feature_id, sample_id, !!sym(value_col)) %>%
+    pivot_wider(names_from = master_feature_id, values_from = !!sym(value_col))
+
+  meta <- df_long %>%
+    select(all_of(meta_cols)) %>%
+    distinct() %>%
+    arrange(match(sample_id, X_wide$sample_id))
+
+  X_mat <- X_wide %>%
+    arrange(sample_id) %>%
+    column_to_rownames("sample_id") %>%
+    as.matrix()
+
+  meta <- meta %>%
+    filter(sample_id %in% rownames(X_mat)) %>%
+    arrange(match(sample_id, rownames(X_mat)))
+
+  for (j in seq_len(ncol(X_mat))) {
+    col <- X_mat[, j]
+    if (anyNA(col)) {
+      mn <- suppressWarnings(min(col, na.rm = TRUE))
+      if (!is.finite(mn)) mn <- 0
+      col[is.na(col)] <- mn
+      X_mat[, j] <- col
+    }
+  }
+
+  pca <- prcomp(X_mat, center = TRUE, scale. = FALSE)
+  var_exp <- (pca$sdev^2 / sum(pca$sdev^2)) * 100
+
+  pca_df <- as.data.frame(pca$x[, 1:2, drop = FALSE]) %>%
+    rownames_to_column("sample_id") %>%
+    left_join(meta, by = "sample_id")
+
+  list(pca_df = pca_df, var_exp = var_exp)
+}
+
+df_all <- X_long_final %>%
+  select(master_feature_id, sample_id, sample_type, any_of(c("inj_order", "variety", "dpi", "timepoint")), !!sym(value_col)) %>%
+  filter(!is.na(sample_type))
+
+# PCA across all injections
+pca_all <- build_pca(df_all, value_col, c("sample_id", "sample_type", "inj_order", "variety", "dpi", "timepoint"))
+
+p_alltypes <- ggplot(pca_all$pca_df, aes(PC1, PC2, color = sample_type)) +
+  geom_point(size = 2.4, alpha = 0.85) +
+  theme_bw() +
+  labs(
+    title = "PCA of all injections (post-normalisation)",
+    subtitle = paste0("Value: ", value_col),
+    x = paste0("PC1 (", round(pca_all$var_exp[1], 1), "%)"),
+    y = paste0("PC2 (", round(pca_all$var_exp[2], 1), "%)"),
+    color = "Sample type"
+  )
+
+ggsave(file.path(out_dir, "Fig_QC_PCA_alltypes_PC1_PC2.png"), p_alltypes, width = 8, height = 6, dpi = 300)
+
+# PCA of biological samples only
+df_samp <- df_all %>% filter(sample_type == "Sample")
+pca_samp <- build_pca(df_samp, value_col, c("sample_id", "sample_type", "inj_order", "variety", "dpi", "timepoint"))
+
+if ("variety" %in% names(pca_samp$pca_df)) {
+  p_samples <- ggplot(pca_samp$pca_df, aes(PC1, PC2, color = variety)) +
+    geom_point(size = 2.4, alpha = 0.9) +
+    theme_bw() +
+    labs(
+      title = "PCA of biological samples (post-normalisation)",
+      x = paste0("PC1 (", round(pca_samp$var_exp[1], 1), "%)"),
+      y = paste0("PC2 (", round(pca_samp$var_exp[2], 1), "%)")
+    )
+
+  ggsave(file.path(out_dir, "Fig_PCA_samples_by_variety_PC1_PC2.png"), p_samples, width = 8, height = 6, dpi = 300)
+}
+
+# QC-only drift check
+if ("inj_order" %in% names(df_all)) {
+  qc_drift <- df_all %>%
+    filter(sample_type == "QC") %>%
+    group_by(sample_id, inj_order) %>%
+    summarise(med = median(.data[[value_col]], na.rm = TRUE), .groups = "drop") %>%
+    mutate(inj_order = suppressWarnings(as.integer(inj_order))) %>%
+    arrange(inj_order)
+
+  p_drift_qc <- ggplot(qc_drift, aes(inj_order, med)) +
+    geom_point(size = 2.4) +
+    geom_smooth(method = "loess", se = FALSE, span = 0.8) +
+    theme_bw() +
+    labs(
+      title = "QC drift check (QC-only)",
+      x = "Injection order",
+      y = paste0("QC median ", value_col)
+    )
+
+  ggsave(file.path(out_dir, "FigS_QC_drift_median_vs_injorder.png"), p_drift_qc, width = 8.5, height = 4.8, dpi = 300)
+}
+
+# QC RSD distribution on the injection scale
+if ("sig_mg" %in% names(X_long_final)) {
+  feat_rsd <- X_long_final %>%
+    filter(sample_type == "QC") %>%
+    group_by(master_feature_id) %>%
+    summarise(
+      qc_mean = mean(sig_mg, na.rm = TRUE),
+      qc_sd = sd(sig_mg, na.rm = TRUE),
+      qc_rsd = 100 * qc_sd / qc_mean,
+      .groups = "drop"
+    )
+
+  p_rsd <- ggplot(feat_rsd, aes(qc_rsd)) +
+    geom_histogram(bins = 100) +
+    geom_vline(xintercept = 70, linetype = 2) +
+    theme_bw() +
+    labs(
+      title = "QC feature RSD distribution",
+      x = "QC RSD (%)",
+      y = "Features"
+    )
+
+  ggsave(file.path(out_dir, "FigS_QC_RSD_distribution.png"), p_rsd, width = 8, height = 5, dpi = 300)
+}
