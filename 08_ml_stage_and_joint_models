@@ -1,0 +1,164 @@
+# ============================================================
+# 08_ml_stage_and_joint_models.R
+#
+# Purpose
+# -------
+# Run the Chapter 4 stage-aware machine-learning analyses:
+# - within-variety stage classification
+# - joint variety × stage classification
+#
+# Notes
+# -----
+# The original notebook included additional plot-building and collapsed
+# confusion matrices. This cleaned script focuses on the training/evaluation
+# backbone and writes reusable CSV outputs for later plotting.
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(stringr)
+  library(readr)
+  library(purrr)
+  library(tibble)
+  library(glmnet)
+})
+
+xlong_file <- "data/processed/normalised/X_long_final.csv"
+out_dir <- "outputs/intermediate/ml_stage_joint"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+X_long_final <- readr::read_csv(xlong_file, show_col_types = FALSE)
+value_col <- "area_log2_qc_loess_mass"
+
+df_ml_long <- X_long_final %>%
+  filter(sample_type == "Sample", inoc_status == "inoculated") %>%
+  mutate(
+    val = suppressWarnings(as.numeric(.data[[value_col]])),
+    stage_final = coalesce(stage_matched, stage)
+  ) %>%
+  filter(!is.na(variety), !is.na(stage_final)) %>%
+  select(sample_id, variety, stage_final, master_feature_id, val)
+
+meta_ml <- df_ml_long %>%
+  distinct(sample_id, variety, stage_final) %>%
+  mutate(variety_stage = paste(variety, stage_final, sep = "__"))
+
+X_wide <- df_ml_long %>%
+  select(sample_id, master_feature_id, val) %>%
+  pivot_wider(names_from = master_feature_id, values_from = val)
+
+ml_df <- meta_ml %>%
+  inner_join(X_wide, by = "sample_id")
+
+scale_prepare <- function(df, y_col, na_threshold = 0.20) {
+  id_cols <- c("sample_id", y_col)
+  pred_cols <- setdiff(names(df), id_cols)
+
+  miss_rate <- vapply(df[, pred_cols, drop = FALSE], function(x) mean(is.na(x)), numeric(1))
+  keep_cols_1 <- names(miss_rate)[miss_rate <= na_threshold]
+  df2 <- df %>% select(all_of(c("sample_id", y_col, keep_cols_1)))
+
+  pred_cols2 <- setdiff(names(df2), c("sample_id", y_col))
+  meds <- vapply(df2[, pred_cols2, drop = FALSE], function(x) median(x, na.rm = TRUE), numeric(1))
+  meds[!is.finite(meds)] <- 0
+
+  for (nm in pred_cols2) df2[[nm]][is.na(df2[[nm]])] <- meds[[nm]]
+
+  sds <- vapply(df2[, pred_cols2, drop = FALSE], sd, numeric(1))
+  keep_cols_2 <- names(sds)[is.finite(sds) & sds > 0]
+  df3 <- df2 %>% select(all_of(c("sample_id", y_col, keep_cols_2)))
+
+  pred_cols3 <- setdiff(names(df3), c("sample_id", y_col))
+  means <- vapply(df3[, pred_cols3, drop = FALSE], mean, numeric(1))
+  sds2 <- vapply(df3[, pred_cols3, drop = FALSE], sd, numeric(1))
+  sds2[!is.finite(sds2) | sds2 == 0] <- 1
+
+  x <- as.matrix(df3[, pred_cols3, drop = FALSE])
+  x <- sweep(x, 2, means[pred_cols3], FUN = "-")
+  x <- sweep(x, 2, sds2[pred_cols3], FUN = "/")
+
+  list(df = df3, x = x, pred_cols = pred_cols3, means = means, sds = sds2, meds = meds)
+}
+
+run_glmnet_repeated <- function(df, outcome_col, n_repeats = 30, alpha_grid = c(0, 0.25, 0.5, 0.75, 1)) {
+  split_one_class <- function(df_class, prop = 0.8) {
+    n <- nrow(df_class)
+    n_train <- max(1, floor(prop * n))
+    idx <- sample(seq_len(n), size = n_train)
+    list(train = df_class[idx, , drop = FALSE], test = df_class[-idx, , drop = FALSE])
+  }
+
+  purrr::map_dfr(seq_len(n_repeats), function(seed_id) {
+    set.seed(seed_id)
+
+    split_list <- df %>%
+      split(.[[outcome_col]]) %>%
+      lapply(split_one_class, prop = 0.8)
+
+    train_df <- bind_rows(lapply(split_list, `[[`, "train"))
+    test_df <- bind_rows(lapply(split_list, `[[`, "test"))
+
+    prep_train <- scale_prepare(train_df, outcome_col)
+    pred_cols <- prep_train$pred_cols
+
+    # apply train medians to test
+    test_df2 <- test_df %>% select(all_of(c("sample_id", outcome_col, pred_cols)))
+    for (nm in pred_cols) test_df2[[nm]][is.na(test_df2[[nm]])] <- prep_train$meds[[nm]]
+
+    x_test <- as.matrix(test_df2[, pred_cols, drop = FALSE])
+    x_test <- sweep(x_test, 2, prep_train$means[pred_cols], FUN = "-")
+    x_test <- sweep(x_test, 2, prep_train$sds[pred_cols], FUN = "/")
+
+    y_train <- factor(prep_train$df[[outcome_col]])
+    y_test <- factor(test_df2[[outcome_col]], levels = levels(y_train))
+
+    cv_results <- map_dfr(alpha_grid, function(a) {
+      cvfit <- cv.glmnet(
+        x = prep_train$x,
+        y = y_train,
+        family = "multinomial",
+        alpha = a,
+        type.measure = "class",
+        nfolds = 5,
+        standardize = FALSE
+      )
+      tibble(alpha = a, lambda_min = cvfit$lambda.min, cv_error_min = min(cvfit$cvm, na.rm = TRUE))
+    })
+
+    best_alpha <- cv_results$alpha[which.min(cv_results$cv_error_min)]
+    best_lambda <- cv_results$lambda_min[which.min(cv_results$cv_error_min)]
+
+    final_fit <- glmnet(
+      x = prep_train$x,
+      y = y_train,
+      family = "multinomial",
+      alpha = best_alpha,
+      lambda = best_lambda,
+      standardize = FALSE
+    )
+
+    pred_class <- predict(final_fit, newx = x_test, type = "class")
+    pred_class <- factor(as.vector(pred_class[, 1]), levels = levels(y_test))
+    cm <- table(Truth = y_test, Predicted = pred_class)
+
+    tibble(
+      repeat_id = seed_id,
+      outcome = outcome_col,
+      accuracy = sum(diag(cm)) / sum(cm)
+    )
+  })
+}
+
+# Within-variety stage models
+within_stage_metrics <- purrr::map_dfr(unique(ml_df$variety), function(vv) {
+  df_sub <- ml_df %>% filter(variety == vv) %>% select(-variety, -variety_stage)
+  run_glmnet_repeated(df_sub, "stage_final") %>% mutate(variety = vv)
+})
+
+write_csv(within_stage_metrics, file.path(out_dir, "ML_within_variety_stage_metrics.csv"))
+
+# Joint variety × stage
+joint_df <- ml_df %>% select(-variety, -stage_final)
+joint_metrics <- run_glmnet_repeated(joint_df, "variety_stage")
+write_csv(joint_metrics, file.path(out_dir, "ML_joint_variety_stage_metrics.csv"))
