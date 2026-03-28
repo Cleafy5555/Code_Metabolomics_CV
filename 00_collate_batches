@@ -1,0 +1,308 @@
+# ============================================================
+# 00_collate_batches_pos.R
+#
+# Purpose
+# -------
+# Collate positive-mode MS-DIAL batch exports into a single master feature
+# matrix for the Chapter 4 metabolomics analysis.
+#
+# What this script does
+# ---------------------
+# 1. Reads Area / Mz / RT tables for each MS-DIAL batch.
+# 2. Parses sample identifiers from the exported column names.
+# 3. Reconstructs sample metadata, including:
+#    - injection order
+#    - run date
+#    - extraction replicate
+#    - biological code token
+# 4. Joins DPI and extraction-weight metadata from spreadsheets.
+# 5. Assigns biological samples to broccoli, broccolini, or gai-lan.
+# 6. Merges features across batches using m/z and retention-time tolerances.
+# 7. Writes master metadata and the collated area matrix.
+#
+# Main outputs
+# ------------
+# - data/processed/metadata_master.csv
+# - data/processed/feature_map_master.csv
+# - data/processed/feature_info_master.csv
+# - data/processed/X_area_master.csv
+#
+# Notes
+# -----
+# This is the cleaned repository version of a longer pasted working script.
+# Update file and folder names to match your own local data layout.
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(readxl)
+  library(janitor)
+  library(stringr)
+  library(readr)
+})
+
+# ----------------------------
+# 0) Paths
+# ----------------------------
+analysis_dir <- "data/raw/metabolomics_analysis"
+batches_dir  <- file.path(analysis_dir, "batches_files")
+out_dir      <- "data/processed"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+schedule_path <- file.path(analysis_dir, "Schedule transcriptomics.xlsx")
+weights_path  <- file.path(analysis_dir, "Metabolite_extraction_weights.xlsx")
+lookup_path   <- file.path(analysis_dir, "letter_lookup_table.xlsx")  # optional
+
+# ----------------------------
+# 1) Helper functions
+# ----------------------------
+find_batch_file <- function(prefix, batch_id) {
+  pat <- paste0("^", prefix, "_0_", batch_id, "(\\.txt)?$")
+  hit <- list.files(batches_dir, pattern = pat, full.names = TRUE, ignore.case = TRUE)
+  if (length(hit) == 0) stop("Missing file: ", prefix, "_0_", batch_id)
+  hit[1]
+}
+
+read_msdial_rawnames <- function(path) {
+  readr::read_delim(
+    path,
+    delim = "\t",
+    show_col_types = FALSE,
+    col_types = readr::cols(.default = readr::col_character()),
+    na = c("", "NA", "NaN", "null", "NULL")
+  )
+}
+
+drop_dotdot_cols <- function(df) {
+  df %>% select(-matches("^\\.\\.\\.\\d+$"))
+}
+
+# ----------------------------
+# 2) Discover Area files
+# ----------------------------
+area_files <- list.files(
+  batches_dir,
+  pattern = "^Area_0_\\d+(\\.txt)?$",
+  full.names = TRUE,
+  ignore.case = TRUE
+)
+stopifnot(length(area_files) > 0)
+
+batch_ids <- str_match(basename(area_files), "^Area_0_(\\d+)")[, 2] %>% unique()
+
+# ----------------------------
+# 3) Recover sample IDs from Area headers
+# ----------------------------
+get_sample_ids_from_area <- function(area_path) {
+  hdr <- names(readr::read_delim(area_path, delim = "\t", n_max = 0, show_col_types = FALSE))
+  hdr[str_detect(hdr, "^\\d{4}_")]
+}
+
+all_sample_ids <- area_files %>%
+  purrr::map(get_sample_ids_from_area) %>%
+  unlist() %>%
+  unique()
+
+meta <- tibble(sample_id = all_sample_ids) %>%
+  separate(
+    sample_id,
+    into = c("inj_order", "run_date", "polarity", "code_token", "extract"),
+    sep = "_",
+    remove = FALSE,
+    fill = "right"
+  ) %>%
+  mutate(
+    inj_order = suppressWarnings(as.integer(inj_order)),
+    extract = suppressWarnings(as.integer(extract)),
+    code_token = as.character(code_token)
+  ) %>%
+  mutate(
+    sample_id_l = tolower(sample_id),
+    code_token_u = toupper(code_token),
+    is_blank = str_detect(sample_id_l, "_blank_") |
+      str_detect(code_token_u, "^BLANK") |
+      code_token_u %in% c("BLANK"),
+    is_qc = str_detect(sample_id_l, "_qc_") |
+      str_detect(code_token_u, "^QC"),
+    sample_type = case_when(
+      is_qc ~ "QC",
+      is_blank ~ "Blank",
+      TRUE ~ "Sample"
+    )
+  ) %>%
+  select(-sample_id_l, -code_token_u)
+
+# ----------------------------
+# 4) Join schedule metadata (DPI)
+# ----------------------------
+meta <- meta %>%
+  mutate(timepoint = suppressWarnings(as.integer(str_extract(code_token, "^\\d+"))))
+
+if (file.exists(schedule_path)) {
+  sched <- readxl::read_excel(schedule_path) %>% janitor::clean_names()
+  harvest_col <- intersect(names(sched), c("harvest", "batch", "timepoint", "time_point"))[1]
+  dpi_col <- intersect(names(sched), c("dpi", "days_post_inoculation", "days"))[1]
+
+  if (!is.na(harvest_col) && !is.na(dpi_col)) {
+    timepoint_dpi <- sched %>%
+      transmute(
+        timepoint = suppressWarnings(as.integer(str_extract(as.character(.data[[harvest_col]]), "\\d+"))),
+        dpi = suppressWarnings(as.integer(str_extract(as.character(.data[[dpi_col]]), "\\d+")))
+      ) %>%
+      filter(!is.na(timepoint), !is.na(dpi)) %>%
+      distinct()
+
+    meta <- meta %>% left_join(timepoint_dpi, by = "timepoint")
+  }
+}
+
+# ----------------------------
+# 5) Join extraction weights
+# ----------------------------
+if (file.exists(weights_path)) {
+  w <- readxl::read_excel(weights_path) %>%
+    janitor::clean_names() %>%
+    rename(sample_raw = sample, extraction_weight_g = sample_weight) %>%
+    mutate(
+      sample_raw = as.character(sample_raw),
+      code_token = case_when(
+        str_detect(sample_raw, "^\\d{4}_") ~ str_match(sample_raw, "^\\d{4}_[^_]+_[^_]+_([^_]+)")[, 2],
+        TRUE ~ sample_raw
+      ),
+      extraction_weight_g = suppressWarnings(as.numeric(extraction_weight_g)),
+      extraction_weight_mg = extraction_weight_g * 1000
+    ) %>%
+    select(code_token, extraction_weight_g, extraction_weight_mg) %>%
+    distinct(code_token, .keep_all = TRUE)
+
+  meta <- meta %>% left_join(w, by = "code_token")
+}
+
+# ----------------------------
+# 6) Assign biological variety from code token
+# ----------------------------
+meta <- meta %>%
+  mutate(
+    code_token_u = toupper(as.character(code_token)),
+    is_main_bik = str_detect(code_token_u, "^\\d+[BIK]\\d+$"),
+    variety_code = if_else(
+      is_main_bik,
+      str_match(code_token_u, "^\\d+([BIK])\\d+$")[, 2],
+      NA_character_
+    ),
+    variety = case_when(
+      variety_code == "B" ~ "broccolini",
+      variety_code == "I" ~ "broccoli",
+      variety_code == "K" ~ "gai-lan",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  select(-code_token_u)
+
+# ----------------------------
+# 7) Load batch tables
+# ----------------------------
+read_batch <- function(batch_id) {
+  f_area <- find_batch_file("Area", batch_id)
+  f_mz   <- find_batch_file("Mz", batch_id)
+  f_rt   <- find_batch_file("RT", batch_id)
+
+  list(
+    batch_id = batch_id,
+    area = drop_dotdot_cols(read_msdial_rawnames(f_area)),
+    mz   = drop_dotdot_cols(read_msdial_rawnames(f_mz)),
+    rt   = drop_dotdot_cols(read_msdial_rawnames(f_rt))
+  )
+}
+
+batches <- setNames(lapply(batch_ids, read_batch), batch_ids)
+
+# ----------------------------
+# 8) Create feature coordinates and master feature IDs
+# ----------------------------
+get_feature_coords <- function(batch_obj) {
+  a <- batch_obj$area
+  tibble(
+    batch_id  = batch_obj$batch_id,
+    batch_row = seq_len(nrow(a)),
+    mz = suppressWarnings(as.numeric(a[["Average Mz"]])),
+    rt = suppressWarnings(as.numeric(a[["Average Rt(min)"]]))
+  ) %>%
+    filter(!is.na(mz), !is.na(rt))
+}
+
+features_long <- purrr::imap_dfr(batches, ~ get_feature_coords(.x)) %>%
+  arrange(mz, rt) %>%
+  mutate(master_feature_id = NA_character_)
+
+mz_tol <- 0.005
+rt_tol <- 0.15
+current_id <- 0L
+
+for (i in seq_len(nrow(features_long))) {
+  if (!is.na(features_long$master_feature_id[i])) next
+  current_id <- current_id + 1L
+  id <- sprintf("F%06d", current_id)
+  features_long$master_feature_id[i] <- id
+
+  mz0 <- features_long$mz[i]
+  rt0 <- features_long$rt[i]
+
+  hits <- which(
+    is.na(features_long$master_feature_id) &
+      abs(features_long$mz - mz0) <= mz_tol &
+      abs(features_long$rt - rt0) <= rt_tol
+  )
+
+  if (length(hits) > 0) features_long$master_feature_id[hits] <- id
+}
+
+feature_map <- features_long %>%
+  select(batch_id, batch_row, mz, rt, master_feature_id)
+
+feature_info_master <- feature_map %>%
+  group_by(master_feature_id) %>%
+  summarise(
+    mz_median = median(mz, na.rm = TRUE),
+    rt_median = median(rt, na.rm = TRUE),
+    batches_present = n_distinct(batch_id),
+    .groups = "drop"
+  )
+
+# ----------------------------
+# 9) Build the collated Area matrix
+# ----------------------------
+get_area_long <- function(batch_obj) {
+  a <- batch_obj$area
+  sample_cols <- names(a)[str_detect(names(a), "^\\d{4}_")]
+  stopifnot(length(sample_cols) > 0)
+
+  A <- a %>%
+    select(all_of(sample_cols)) %>%
+    mutate(across(everything(), ~ suppressWarnings(as.numeric(.x))))
+
+  tibble(batch_row = seq_len(nrow(A))) %>%
+    bind_cols(A) %>%
+    pivot_longer(-batch_row, names_to = "sample_id", values_to = "area") %>%
+    mutate(batch_id = batch_obj$batch_id)
+}
+
+area_long_all <- purrr::imap_dfr(batches, ~ get_area_long(.x))
+
+area_master_long <- area_long_all %>%
+  left_join(feature_map, by = c("batch_id", "batch_row")) %>%
+  select(master_feature_id, sample_id, area)
+
+X_area_master <- area_master_long %>%
+  group_by(master_feature_id, sample_id) %>%
+  summarise(area = mean(area, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = sample_id, values_from = area) %>%
+  arrange(master_feature_id)
+
+# ----------------------------
+# 10) Save outputs
+# ----------------------------
+write_csv(meta, file.path(out_dir, "metadata_master.csv"))
+write_csv(feature_map, file.path(out_dir, "feature_map_master.csv"))
+write_csv(feature_info_master, file.path(out_dir, "feature_info_master.csv"))
+write_csv(X_area_master, file.path(out_dir, "X_area_master.csv"))
