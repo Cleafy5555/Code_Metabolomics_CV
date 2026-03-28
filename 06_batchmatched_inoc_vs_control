@@ -1,0 +1,316 @@
+# ============================================================
+# 06_batchmatched_inoc_vs_control.R
+#
+# Purpose
+# -------
+# Run the stage-matched inoculated-vs-control contrasts described in the
+# Chapter 4 methods and produce the pathway heatmap inputs used for the
+# inoculation-focused figure.
+#
+# Covered analyses
+# ----------------
+# - batch-matched control assignment
+# - feature-level Welch tests within variety × stage strata
+# - detection / presence–absence Fisher tests
+# - mummichog export files
+# - heatmap of pathway enrichment across host × stage strata
+#
+# Inputs
+# ------
+# - data/processed/normalised/X_long_final.csv
+# - data/processed/feature_info_master.csv
+# - data/raw/stage_map.xlsx
+# - data/raw/mummichog_inoc_outputs/*.csv   (for the heatmap section)
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(readr)
+  library(readxl)
+  library(dplyr)
+  library(tidyr)
+  library(stringr)
+  library(purrr)
+  library(ggplot2)
+})
+
+xlong_file <- "data/processed/normalised/X_long_final.csv"
+stage_xlsx <- "data/raw/stage_map.xlsx"
+featinfo_file <- "data/processed/feature_info_master.csv"
+mummi_dir <- "data/raw/mummichog_inoc_outputs"
+
+out_dir <- "outputs/intermediate/batchmatched_inoc_vs_control"
+fig_dir <- "outputs/figures/inoc_vs_control"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(fig_dir, showWarnings = FALSE, recursive = TRUE)
+
+X_long_final <- readr::read_csv(xlong_file, show_col_types = FALSE)
+feature_info <- readr::read_csv(featinfo_file, show_col_types = FALSE)
+stage_map <- readxl::read_excel(stage_xlsx)
+
+value_col <- "area_log2_qc_loess_mass"
+
+std_variety <- function(x) {
+  x <- trimws(as.character(x))
+  x <- tolower(x)
+  x <- gsub("_", "-", x)
+  x <- gsub("gai lan", "gai-lan", x)
+  x
+}
+
+is_ctrl_token <- function(ct) str_detect(ct, "^[ABCD][BIK]\\d+$")
+
+# ----------------------------
+# 1) Stage map reconstruction
+# ----------------------------
+stage_map2 <- stage_map %>%
+  rename(variety = Variety) %>%
+  mutate(variety = std_variety(variety)) %>%
+  pivot_longer(cols = starts_with("Stage"), names_to = "stage_raw", values_to = "dpi_text") %>%
+  mutate(
+    stage_order = as.integer(str_extract(stage_raw, "\\d+")),
+    stage = paste0("Stage_", stage_order),
+    dpi_text = str_trim(as.character(dpi_text)),
+    dpi_text = str_remove_all(dpi_text, "(?i)\\s*dpi\\s*"),
+    dpi_text = str_replace_all(dpi_text, "\\s+", ""),
+    dpi_text = str_replace_all(dpi_text, "\u2013|\u2014", "-"),
+    dpi_text = na_if(dpi_text, "")
+  ) %>%
+  mutate(
+    dpi_min = case_when(
+      str_detect(dpi_text, "^<") ~ 0,
+      str_detect(dpi_text, "^>") ~ as.numeric(str_remove(dpi_text, "^>")),
+      str_detect(dpi_text, "^\\d+-\\d+$") ~ as.numeric(str_extract(dpi_text, "^\\d+")),
+      TRUE ~ NA_real_
+    ),
+    dpi_max = case_when(
+      str_detect(dpi_text, "^<") ~ as.numeric(str_remove(dpi_text, "^<")) - 1,
+      str_detect(dpi_text, "^>") ~ Inf,
+      str_detect(dpi_text, "^\\d+-\\d+$") ~ as.numeric(str_extract(dpi_text, "\\d+$")),
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  select(variety, dpi_min, dpi_max, stage, stage_order)
+
+# ----------------------------
+# 2) Sample metadata and stage assignment
+# ----------------------------
+samp <- X_long_final %>%
+  distinct(sample_id, code_token, sample_type, inoc_status, variety, dpi) %>%
+  filter(sample_type == "Sample") %>%
+  mutate(
+    code_token_u = toupper(as.character(code_token)),
+    inoc_status = as.character(inoc_status),
+    variety = std_variety(variety),
+    dpi = suppressWarnings(as.numeric(dpi)),
+    is_ctrl = is_ctrl_token(code_token_u),
+    control_batch = if_else(is_ctrl, str_sub(code_token_u, 1, 1), NA_character_),
+    ctrl_var_code = if_else(is_ctrl, str_sub(code_token_u, 2, 2), NA_character_),
+    variety = if_else(
+      is_ctrl,
+      recode(ctrl_var_code, B = "broccolini", I = "broccoli", K = "gai-lan", .default = NA_character_),
+      variety
+    )
+  )
+
+stage_inoc_tbl <- samp %>%
+  filter(inoc_status == "inoculated") %>%
+  filter(!is.na(variety), !is.na(dpi)) %>%
+  left_join(stage_map2, by = "variety", relationship = "many-to-many") %>%
+  filter(dpi >= dpi_min, dpi <= dpi_max) %>%
+  group_by(sample_id) %>%
+  mutate(window = dpi_max - dpi_min) %>%
+  arrange(window, stage_order) %>%
+  slice_head(n = 1) %>%
+  ungroup() %>%
+  transmute(sample_id, stage_inoc = stage)
+
+ctrl_map <- tibble(
+  variety = rep(c("broccoli", "gai-lan", "broccolini"), each = 4),
+  control_batch = rep(c("A", "B", "C", "D"), times = 3),
+  stage_ctrl = c(
+    "Stage_0", "Stage_1", "Stage_2", "Stage_3",
+    "Stage_0", "Stage_1", "Stage_2", "Stage_3",
+    "Stage_1", "Stage_2", "Stage_3", "Stage_3"
+  )
+)
+
+samp2 <- samp %>%
+  left_join(stage_inoc_tbl, by = "sample_id") %>%
+  left_join(ctrl_map, by = c("variety", "control_batch")) %>%
+  mutate(
+    stage_final = case_when(
+      inoc_status == "control_non_inoc" ~ stage_ctrl,
+      inoc_status == "inoculated" ~ stage_inoc,
+      TRUE ~ NA_character_
+    )
+  )
+
+# ----------------------------
+# 3) Feature-level abundance tests
+# ----------------------------
+df_long2 <- X_long_final %>%
+  filter(sample_type == "Sample") %>%
+  left_join(
+    samp2 %>% select(sample_id, inoc_status, variety, stage_final, control_batch),
+    by = "sample_id",
+    suffix = c(".x", ".y")
+  ) %>%
+  mutate(
+    inoc_status = as.character(.data$inoc_status.y),
+    variety = std_variety(.data$variety.y),
+    stage = as.character(.data$stage_final),
+    control_batch = as.character(.data$control_batch)
+  ) %>%
+  filter(!is.na(inoc_status), !is.na(variety), !is.na(stage))
+
+stage_to_batch <- ctrl_map %>%
+  mutate(variety = std_variety(variety)) %>%
+  group_by(variety, stage_ctrl) %>%
+  summarise(control_batches = list(unique(control_batch)), .groups = "drop") %>%
+  rename(stage = stage_ctrl)
+
+run_abundance_stratum <- function(vv, ss) {
+  cb <- stage_to_batch %>% filter(variety == vv, stage == ss) %>% pull(control_batches)
+  if (length(cb) == 0) return(NULL)
+  cb <- cb[[1]]
+
+  d <- df_long2 %>%
+    filter(variety == vv, stage == ss) %>%
+    filter(
+      inoc_status == "inoculated" |
+        (inoc_status == "control_non_inoc" & control_batch %in% cb)
+    ) %>%
+    select(sample_id, master_feature_id, value = !!sym(value_col), inoc_status)
+
+  n_inoc_samples <- d %>% filter(inoc_status == "inoculated") %>% distinct(sample_id) %>% nrow()
+  n_ctrl_samples <- d %>% filter(inoc_status == "control_non_inoc") %>% distinct(sample_id) %>% nrow()
+  if (n_inoc_samples < 3 || n_ctrl_samples < 3) return(NULL)
+
+  d %>%
+    group_by(master_feature_id) %>%
+    summarise(
+      mean_ctrl = mean(value[inoc_status == "control_non_inoc"], na.rm = TRUE),
+      mean_inoc = mean(value[inoc_status == "inoculated"], na.rm = TRUE),
+      logFC = mean_inoc - mean_ctrl,
+      t_score = tryCatch(t.test(value ~ inoc_status)$statistic[[1]], error = function(e) NA_real_),
+      p = tryCatch(t.test(value ~ inoc_status)$p.value, error = function(e) NA_real_),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      variety = vv,
+      stage = ss,
+      p_adj = p.adjust(p, method = "BH")
+    ) %>%
+    relocate(variety, stage)
+}
+
+strata <- df_long2 %>% distinct(variety, stage) %>% arrange(variety, stage)
+abundance_all <- pmap_dfr(list(as.character(strata$variety), as.character(strata$stage)), ~ run_abundance_stratum(..1, ..2))
+write_csv(abundance_all, file.path(out_dir, "MASTER_abundance_tests_BATCHMATCHED.csv"))
+
+# ----------------------------
+# 4) Mummichog exports
+# ----------------------------
+feat_mzrt <- feature_info %>%
+  transmute(
+    master_feature_id = as.character(master_feature_id),
+    mz = suppressWarnings(as.numeric(mz_median)),
+    rt = suppressWarnings(as.numeric(rt_median))
+  )
+
+abundance_mz <- abundance_all %>%
+  mutate(master_feature_id = as.character(master_feature_id)) %>%
+  left_join(feat_mzrt, by = "master_feature_id") %>%
+  filter(is.finite(mz), is.finite(p), is.finite(t_score))
+
+for (i in seq_len(nrow(strata))) {
+  vv <- as.character(strata$variety[i])
+  ss <- as.character(strata$stage[i])
+
+  d <- abundance_mz %>%
+    filter(variety == vv, stage == ss) %>%
+    arrange(p, desc(abs(logFC)))
+
+  if (nrow(d) == 0) next
+
+  lab <- paste0(vv, "_", ss, "_batchmatched")
+  write_csv(
+    d %>% transmute(`m.z` = mz, `p.value` = p, `t.score` = t_score, mode = "POS"),
+    file.path(out_dir, paste0("MUMMICHOG_", lab, "_MIN.csv"))
+  )
+}
+
+# ----------------------------
+# 5) Pathway heatmap from mummichog output CSVs
+# ----------------------------
+if (dir.exists(mummi_dir)) {
+  files <- list.files(mummi_dir, pattern = "^mummichog_pathway_.*\\.csv$", full.names = TRUE)
+  if (length(files) > 0) {
+    parse_from_filename <- function(fn) {
+      b <- basename(fn)
+      m <- str_match(b, "^mummichog_pathway_(S\\d+)\\s+(.+)\\.csv$")
+      tibble(file = fn, stage = m[2], variety = toupper(m[3]))
+    }
+
+    pretty_variety <- function(x) recode(as.character(x),
+      "BROCCOLI" = "Broccoli",
+      "BROCCOLINI" = "Broccolini",
+      "GAI-LAN" = "Gai-lan",
+      .default = as.character(x)
+    )
+
+    file_meta <- bind_rows(lapply(files, parse_from_filename))
+
+    read_one <- function(path, stage, variety) {
+      dat <- read_csv(path, show_col_types = FALSE, name_repair = "minimal")
+      names(dat)[1] <- "Pathway"
+
+      nms <- names(dat)
+      p_col <- nms[str_detect(nms, regex("P\\(Gamma\\)|P\\.Gamma|P_Gamma", ignore_case = TRUE))][1]
+      padj_col <- nms[str_detect(nms, regex("Adj.*Gamma", ignore_case = TRUE))][1]
+
+      dat %>%
+        transmute(
+          variety = variety,
+          stage = stage,
+          Pathway = as.character(Pathway),
+          P_Gamma = suppressWarnings(as.numeric(.data[[p_col]])),
+          AdjP_Gamma = suppressWarnings(as.numeric(.data[[padj_col]]))
+        ) %>%
+        mutate(
+          neglog10P = -log10(pmax(P_Gamma, 1e-300)),
+          sig = is.finite(AdjP_Gamma) & AdjP_Gamma <= 0.05
+        )
+    }
+
+    plot_tbl <- pmap_dfr(list(file_meta$file, file_meta$stage, file_meta$variety), read_one)
+
+    top_pathways <- plot_tbl %>%
+      group_by(variety, stage) %>%
+      arrange(AdjP_Gamma, P_Gamma, desc(neglog10P)) %>%
+      slice_head(n = 8) %>%
+      ungroup() %>%
+      distinct(Pathway) %>%
+      pull(Pathway)
+
+    heat_df <- plot_tbl %>%
+      filter(Pathway %in% top_pathways) %>%
+      mutate(
+        stage = factor(stage, levels = c("S0", "S1", "S2", "S3")),
+        variety = factor(variety, levels = c("BROCCOLI", "BROCCOLINI", "GAI-LAN")),
+        x_lab = paste(stage, pretty_variety(variety))
+      )
+
+    p_heat <- ggplot(heat_df, aes(x_lab, Pathway, fill = neglog10P)) +
+      geom_tile(color = "white", linewidth = 0.25) +
+      geom_text(data = subset(heat_df, sig), aes(label = "*"), size = 3.2) +
+      theme_bw(base_size = 11) +
+      theme(
+        panel.grid = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1)
+      ) +
+      labs(x = NULL, y = NULL, fill = expression(-log[10] * "(P(Gamma))"))
+
+    ggsave(file.path(fig_dir, "Fig_mummichog_pathway_heatmap_batchmatched.png"), p_heat, width = 12, height = 8, dpi = 450)
+  }
+}
