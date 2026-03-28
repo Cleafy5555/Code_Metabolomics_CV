@@ -1,0 +1,156 @@
+# ============================================================
+# 04_stage_driver_exports_and_overlap_sets.R
+#
+# Purpose
+# -------
+# Generate feature-level stage-associated driver tables and overlap sets for
+# the Chapter 4 results.
+#
+# Covered outputs
+# ---------------
+# - omnibus Kruskal–Wallis stage tables
+# - pairwise SCA vs SESP contrast tables
+# - ranked feature lists for MetaboAnalyst / mummichog
+# - overlap-set inputs for UpSet plots and supplementary tables
+#
+# Notes
+# -----
+# The original working code included several exploratory variants. This script
+# captures the final logic that matches the chapter text:
+# - stage analyses performed within each host
+# - both omnibus and pairwise ranked feature sets retained
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(readr)
+  library(dplyr)
+  library(tidyr)
+  library(stringr)
+  library(purrr)
+})
+
+xlong_file <- "data/processed/normalised/X_long_final.csv"
+featinfo_file <- "data/processed/feature_info_master.csv"
+out_dir <- "outputs/intermediate/stage_driver_sets"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+X_long_final <- readr::read_csv(xlong_file, show_col_types = FALSE)
+feature_info <- readr::read_csv(featinfo_file, show_col_types = FALSE)
+
+value_col <- "area_log2_qc_loess_mass"
+
+df_stage <- X_long_final %>%
+  filter(sample_type == "Sample", inoc_status == "inoculated") %>%
+  mutate(stage_final = coalesce(stage_matched, stage)) %>%
+  filter(!is.na(variety), !is.na(stage_final))
+
+# ----------------------------
+# 1) Omnibus within-host Kruskal–Wallis
+# ----------------------------
+run_kw_variety <- function(vv) {
+  d <- df_stage %>% filter(variety == vv)
+
+  d %>%
+    group_by(master_feature_id) %>%
+    summarise(
+      p = tryCatch(kruskal.test(.data[[value_col]] ~ stage_final)$p.value, error = function(e) NA_real_),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      variety = vv,
+      p_adj = p.adjust(p, method = "BH")
+    ) %>%
+    relocate(variety)
+}
+
+kw_tbl <- purrr::map_dfr(unique(df_stage$variety), run_kw_variety)
+write_csv(kw_tbl, file.path(out_dir, "ALL_stage_KW_all_varieties.csv"))
+
+# ----------------------------
+# 2) Pairwise SCA vs SESP within host
+# ----------------------------
+run_pairwise_sca_sesp <- function(vv) {
+  d <- df_stage %>%
+    filter(variety == vv, stage_final %in% c("Stage_1", "Stage_2")) %>%
+    mutate(stage_final = factor(stage_final, levels = c("Stage_1", "Stage_2")))
+
+  d %>%
+    group_by(master_feature_id) %>%
+    summarise(
+      mean_s1 = mean(.data[[value_col]][stage_final == "Stage_1"], na.rm = TRUE),
+      mean_s2 = mean(.data[[value_col]][stage_final == "Stage_2"], na.rm = TRUE),
+      logFC = mean_s2 - mean_s1,
+      t_score = tryCatch(t.test(.data[[value_col]] ~ stage_final)$statistic[[1]], error = function(e) NA_real_),
+      p = tryCatch(t.test(.data[[value_col]] ~ stage_final)$p.value, error = function(e) NA_real_),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      variety = vv,
+      p_adj = p.adjust(p, method = "BH")
+    ) %>%
+    relocate(variety)
+}
+
+pair_tbl <- purrr::map_dfr(unique(df_stage$variety), run_pairwise_sca_sesp)
+write_csv(pair_tbl, file.path(out_dir, "PAIRWISE_SCA_vs_SESP_all_varieties.csv"))
+
+# ----------------------------
+# 3) Mummichog export tables
+# ----------------------------
+feat_mzrt <- feature_info %>%
+  transmute(
+    master_feature_id = as.character(master_feature_id),
+    mz = suppressWarnings(as.numeric(mz_median)),
+    rt = suppressWarnings(as.numeric(rt_median))
+  )
+
+pair_mummi <- pair_tbl %>%
+  mutate(master_feature_id = as.character(master_feature_id)) %>%
+  left_join(feat_mzrt, by = "master_feature_id") %>%
+  filter(is.finite(mz), is.finite(p), is.finite(t_score))
+
+for (vv in unique(pair_mummi$variety)) {
+  d <- pair_mummi %>% filter(variety == vv) %>% arrange(p, desc(abs(logFC)))
+
+  out_min <- d %>% transmute(`m.z` = mz, `p.value` = p, `t.score` = t_score, mode = "POS")
+  out_full <- d %>% transmute(`m.z` = mz, rt, `p.value` = p, p_adj, `t.score` = t_score, logFC, master_feature_id, mode = "POS")
+
+  write_csv(out_min, file.path(out_dir, paste0("MUMMICHOG_", vv, "_SCA_vs_SESP_MIN.csv")))
+  write_csv(out_full, file.path(out_dir, paste0("MUMMICHOG_", vv, "_SCA_vs_SESP_FULL.csv")))
+}
+
+# ----------------------------
+# 4) Simple overlap-set summaries
+# ----------------------------
+topN <- 500
+
+kw_sets <- kw_tbl %>%
+  group_by(variety) %>%
+  arrange(p_adj, p) %>%
+  slice_head(n = topN) %>%
+  ungroup() %>%
+  mutate(set_name = "ALL_topN")
+
+pair_sets <- pair_tbl %>%
+  group_by(variety) %>%
+  arrange(p_adj, p) %>%
+  slice_head(n = topN) %>%
+  ungroup() %>%
+  mutate(set_name = "PW_topN")
+
+sig_kw <- kw_tbl %>%
+  filter(!is.na(p_adj) & p_adj <= 0.05) %>%
+  mutate(set_name = "ALL_sig05")
+
+sig_pair <- pair_tbl %>%
+  filter(!is.na(p_adj) & p_adj <= 0.05) %>%
+  mutate(set_name = "PW_sig")
+
+overlap_sets <- bind_rows(
+  kw_sets %>% select(variety, master_feature_id, set_name),
+  pair_sets %>% select(variety, master_feature_id, set_name),
+  sig_kw %>% select(variety, master_feature_id, set_name),
+  sig_pair %>% select(variety, master_feature_id, set_name)
+)
+
+write_csv(overlap_sets, file.path(out_dir, "overlap_feature_sets_for_upset.csv"))
